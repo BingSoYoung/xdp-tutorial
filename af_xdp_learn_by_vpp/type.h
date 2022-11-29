@@ -1,7 +1,8 @@
 #ifndef _type_h
 #define _type_h
 
-typedef unsigned int u32
+typedef unsigned int u32;
+typedef unsigned char u8;
 
 #define clib_max(a, b) ((a)>(b)?(a):(b))
 
