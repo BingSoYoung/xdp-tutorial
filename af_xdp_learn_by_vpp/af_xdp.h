@@ -1,3 +1,6 @@
+#ifndef _H_AF_XDP_
+#define _H_AF_XDP_
+
 #include <bpf/bpf.h>
 #include <bpf/xsk.h>
 
@@ -28,6 +31,8 @@ typedef struct
     struct xsk_ring_cons rx;
     struct xsk_ring_prod fq;
     int xsk_fd;
+    uint64_t umem_frame_addr[NUM_FRAMES];
+	uint32_t umem_frame_free;
 
     /* fields below are accessed in control-plane only (cold) */
 
@@ -57,12 +62,14 @@ typedef struct
 {
     struct list_head list;
     struct xsk_umem *umem;
+    u32 queue_index;
 }xsk_umem_t;
 
 typedef struct
 {
     struct list_head list;
     struct xsk_socket *xsk;
+    u32 queue_index;
 }xsk_socket_t;
 
 typedef struct
@@ -89,9 +96,6 @@ typedef struct
     u8 hwaddr[6];
 
     u8 rxq_num;
-
-    uint64_t umem_frame_addr[NUM_FRAMES];
-	uint32_t umem_frame_free;
 
     // struct xsk_umem **umem;
     // struct xsk_socket **xsk;
@@ -141,9 +145,12 @@ typedef struct
 void af_xdp_get_q_count (const char *ifname, int *rxq_num, int *txq_num);
 int af_xdp_create_queue (af_xdp_create_if_args_t *args, af_xdp_device_t *ad, int qid);
 void af_xdp_delete_if (af_xdp_device_t * ad);
-af_xdp_device_t* af_xdp_create_if(af_xdp_create_if_args_t);
+af_xdp_device_t* af_xdp_create_if(af_xdp_create_if_args_t* );
 
-
-void rx_and_process();
+void handle_receive_packets(void *arg);
+void rx_and_process(af_xdp_device_t * ad);
 void af_xdp_device_input_handle();
 void af_xdp_device_output_handle();
+
+
+#endif

@@ -10,7 +10,6 @@
 #endif
 
 #include "thpool.h"
-#include "log.h"
 
 #ifdef THPOOL_DEBUG
 #define THPOOL_DEBUG 1
@@ -47,7 +46,7 @@ static void  bsem_wait(struct bsem *bsem_p);
 /* ========================== THREADPOOL ============================ */
 
 /* Initialise thread pool */
-struct thpool_* thpool_init(int num_threads, const char* pool_name){
+threadpool thpool_init(int num_threads, const char* pool_name){
 
 	threads_on_hold   = 0;
 	threads_keepalive = 1;
