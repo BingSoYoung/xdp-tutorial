@@ -24,12 +24,18 @@
 #include <linux/if_ether.h>
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
+#include <sys/ioctl.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
+#include <linux/ip.h>
+#include <linux/icmp.h>
 
-
+#include "thpool.h"
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
 
+#define clib_max(a, b) ((a)>(b)?(a):(b))
 
 #define NUM_FRAMES         4096
 #define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
@@ -233,25 +239,33 @@ static void complete_tx(struct xsk_socket_info *xsk)
 
 	if (!xsk->outstanding_tx)
 		return;
+    if (xsk_ring_prod__needs_wakeup(&xsk->tx))
+    {
+	    while(sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0) < 0)
+        {
+            if (errno != EBUSY && errno != EAGAIN && errno != EINTR)
+				break;
 
-	sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+            if (errno == EAGAIN)
+            {
+                /* Collect/free completed TX buffers */
+                completed = xsk_ring_cons__peek(&xsk->umem->cq,
+                                XSK_RING_CONS__DEFAULT_NUM_DESCS,
+                                &idx_cq);
 
+                if (completed > 0) {
+                    for (int i = 0; i < completed; i++)
+                        xsk_free_umem_frame(xsk,
+                                    *xsk_ring_cons__comp_addr(&xsk->umem->cq,
+                                                    idx_cq++));
 
-	/* Collect/free completed TX buffers */
-	completed = xsk_ring_cons__peek(&xsk->umem->cq,
-					XSK_RING_CONS__DEFAULT_NUM_DESCS,
-					&idx_cq);
-
-	if (completed > 0) {
-		for (int i = 0; i < completed; i++)
-			xsk_free_umem_frame(xsk,
-					    *xsk_ring_cons__comp_addr(&xsk->umem->cq,
-								      idx_cq++));
-
-		xsk_ring_cons__release(&xsk->umem->cq, completed);
-		xsk->outstanding_tx -= completed < xsk->outstanding_tx ?
-			completed : xsk->outstanding_tx;
-	}
+                    xsk_ring_cons__release(&xsk->umem->cq, completed);
+                    xsk->outstanding_tx -= completed < xsk->outstanding_tx ?
+                        completed : xsk->outstanding_tx;
+                }
+            }
+        }
+    }
 }
 
 static inline __sum16 csum16_add(__sum16 csum, __be16 addend)
@@ -272,6 +286,51 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+static inline uint16_t ICMPV4CalculateChecksum(uint16_t *pkt, uint16_t tlen)
+{
+    uint16_t pad = 0;
+    uint32_t csum = pkt[0];
+
+    tlen -= 4;
+    pkt += 2;
+
+    while (tlen >= 32) {
+        csum += pkt[0] + pkt[1] + pkt[2] + pkt[3] + pkt[4] + pkt[5] + pkt[6] +
+            pkt[7] + pkt[8] + pkt[9] + pkt[10] + pkt[11] + pkt[12] + pkt[13] +
+            pkt[14] + pkt[15];
+        tlen -= 32;
+        pkt += 16;
+    }
+
+    while(tlen >= 8) {
+        csum += pkt[0] + pkt[1] + pkt[2] + pkt[3];
+        tlen -= 8;
+        pkt += 4;
+    }
+
+    while(tlen >= 4) {
+        csum += pkt[0] + pkt[1];
+        tlen -= 4;
+        pkt += 2;
+    }
+
+    while (tlen > 1) {
+        csum += pkt[0];
+        tlen -= 2;
+        pkt += 1;
+    }
+
+    if (tlen == 1) {
+        *(uint8_t *)(&pad) = (*(uint8_t *)pkt);
+        csum += pad;
+    }
+
+    csum = (csum >> 16) + (csum & 0x0000FFFF);
+    csum += (csum >> 16);
+
+    return (uint16_t) ~csum;
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
@@ -286,34 +345,62 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
 
-	if (false) {
+	//if (false) {
 		int ret;
 		uint32_t tx_idx = 0;
-		uint8_t tmp_mac[ETH_ALEN];
-		struct in6_addr tmp_ip;
-		struct ethhdr *eth = (struct ethhdr *) pkt;
-		struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-		struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+        uint8_t tmp_mac[ETH_ALEN];
+        // printf("ETH_ALEN:%d\n",ETH_ALEN);
 
-		if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		    len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		    ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		    icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-			return false;
+        struct in_addr tmp_ip;
+        struct ethhdr *eth = (struct ethhdr *) pkt;
+        struct iphdr *ip = (struct iphdr *) (eth + 1);
+        struct icmphdr *icmp = (struct icmphdr *) (ip + 1);
 
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+        // printf("protocol:%d\n",(uint8_t)ip->protocol);
+        // printf("type:%d\n",(uint8_t)icmp->type);
 
-		memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-		memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-		memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+        if (ntohs(eth->h_proto) != ETH_P_IP ||
+        len < (sizeof(*eth) + sizeof(*ip) + sizeof(*icmp)) ||
+        ip->protocol != IPPROTO_ICMP ||
+        icmp->type != ICMP_ECHO)
+        return false;
 
-		icmp->icmp6_type = ICMPV6_ECHO_REPLY;
+        memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+        memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+        memcpy(eth->h_source, tmp_mac, ETH_ALEN);
 
-		csum_replace2(&icmp->icmp6_cksum,
-			      htons(ICMPV6_ECHO_REQUEST << 8),
-			      htons(ICMPV6_ECHO_REPLY << 8));
+        memcpy(&tmp_ip, &ip->saddr, sizeof(tmp_ip));
+        memcpy(&ip->saddr, &ip->daddr, sizeof(tmp_ip));
+        memcpy(&ip->daddr, &tmp_ip, sizeof(tmp_ip));
+
+        icmp->type = ICMP_ECHOREPLY;
+        icmp->checksum = ICMPV4CalculateChecksum((uint16_t *)icmp, len);
+
+		// uint8_t tmp_mac[ETH_ALEN];
+		// struct in6_addr tmp_ip;
+		// struct ethhdr *eth = (struct ethhdr *) pkt;
+		// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
+		// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+
+		// if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
+		//     len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
+		//     ipv6->nexthdr != IPPROTO_ICMPV6 ||
+		//     icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
+		// 	return false;
+
+		// memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+		// memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+		// memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+		// memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
+		// memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
+		// memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+
+		// icmp->icmp6_type = ICMPV6_ECHO_REPLY;
+
+		// csum_replace2(&icmp->icmp6_cksum,
+		// 	      htons(ICMPV6_ECHO_REQUEST << 8),
+		// 	      htons(ICMPV6_ECHO_REPLY << 8));
 
 		/* Here we sent the packet out of the receive port. Note that
 		 * we allocate one entry and schedule it. Your design would be
@@ -333,9 +420,9 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		xsk->stats.tx_bytes += len;
 		xsk->stats.tx_packets++;
 		return true;
-	}
+	//}
 
-	return false;
+	//return false;
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk)
@@ -498,7 +585,32 @@ static void exit_application(int signal)
 	global_exit = true;
 }
 
-int main(int argc, char **argv)
+static void af_xdp_get_q_count (const char *ifname, int *rxq_num, int *txq_num)
+{
+    struct ethtool_channels ec = { .cmd = ETHTOOL_GCHANNELS };
+    struct ifreq ifr = { .ifr_data = (void *) &ec };
+    int fd, err;
+
+    *rxq_num = *txq_num = 1;
+
+    fd = socket (AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+    return;
+
+    snprintf (ifr.ifr_name, sizeof (ifr.ifr_name), "%s", ifname);
+    err = ioctl (fd, SIOCETHTOOL, &ifr);
+
+    close (fd);
+
+    if (err)
+    return;
+
+    *rxq_num = clib_max (ec.combined_count, ec.rx_count);
+    *txq_num = clib_max (ec.combined_count, ec.tx_count);
+}
+
+// void func(int argc, char **argv)
+void func(void *arg)
 {
 	int ret;
 	int xsks_map_fd;
@@ -508,7 +620,7 @@ int main(int argc, char **argv)
 	struct config cfg = {
 		.ifindex   = -1,
 		.do_unload = false,
-		.filename = "",
+		.filename = "af_xdp_kern.o",
 		.progsec = "xdp_sock"
 	};
 	struct xsk_umem_info *umem;
@@ -516,22 +628,32 @@ int main(int argc, char **argv)
 	struct bpf_object *bpf_obj = NULL;
 	pthread_t stats_poll_thread;
 
+    /* cfg */
+    cfg.ifname = "LAN3";
+	cfg.ifindex = if_nametoindex(cfg.ifname);
+
+    cfg.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */
+    cfg.xdp_flags |= XDP_FLAGS_DRV_MODE;  /* Set   flag */
+
+    cfg.xsk_if_queue = (int)arg;
+    /* cfg */
+
 	/* Global shutdown handler */
-	signal(SIGINT, exit_application);
+	// signal(SIGINT, exit_application);
 
 	/* Cmdline options can change progsec */
-	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
+	// parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
 
-	/* Required option */
-	if (cfg.ifindex == -1) {
-		fprintf(stderr, "ERROR: Required option --dev missing\n\n");
-		usage(argv[0], __doc__, long_options, (argc == 1));
-		return EXIT_FAIL_OPTION;
-	}
+	// /* Required option */
+	// if (cfg.ifindex == -1) {
+	// 	fprintf(stderr, "ERROR: Required option --dev missing\n\n");
+	// 	usage(argv[0], __doc__, long_options, (argc == 1));
+	// 	return EXIT_FAIL_OPTION;
+	// }
 
 	/* Unload XDP program if requested */
-	if (cfg.do_unload)
-		return xdp_link_detach(cfg.ifindex, cfg.xdp_flags, 0);
+	// if (cfg.do_unload)
+	// 	return xdp_link_detach(cfg.ifindex, cfg.xdp_flags, 0);
 
 	/* Load custom program if configured */
 	if (cfg.filename[0] != 0) {
@@ -540,7 +662,8 @@ int main(int argc, char **argv)
 		bpf_obj = load_bpf_and_xdp_attach(&cfg);
 		if (!bpf_obj) {
 			/* Error handling done in load_bpf_and_xdp_attach() */
-			exit(EXIT_FAILURE);
+			//exit(EXIT_FAILURE);
+            return;
 		}
 
 		/* We also need to load the xsks_map */
@@ -549,7 +672,8 @@ int main(int argc, char **argv)
 		if (xsks_map_fd < 0) {
 			fprintf(stderr, "ERROR: no xsks map found: %s\n",
 				strerror(xsks_map_fd));
-			exit(EXIT_FAILURE);
+			//exit(EXIT_FAILURE);
+            return;
 		}
 	}
 
@@ -559,7 +683,8 @@ int main(int argc, char **argv)
 	if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
 		fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
 			strerror(errno));
-		exit(EXIT_FAILURE);
+		//exit(EXIT_FAILURE);
+        return;
 	}
 
 	/* Allocate memory for NUM_FRAMES of the default XDP frame size */
@@ -569,7 +694,8 @@ int main(int argc, char **argv)
 			   packet_buffer_size)) {
 		fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
 			strerror(errno));
-		exit(EXIT_FAILURE);
+		//exit(EXIT_FAILURE);
+        return;
 	}
 
 	/* Initialize shared packet_buffer for umem usage */
@@ -577,7 +703,8 @@ int main(int argc, char **argv)
 	if (umem == NULL) {
 		fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
 			strerror(errno));
-		exit(EXIT_FAILURE);
+		//exit(EXIT_FAILURE);
+        return;
 	}
 
 	/* Open and configure the AF_XDP (xsk) socket */
@@ -585,19 +712,20 @@ int main(int argc, char **argv)
 	if (xsk_socket == NULL) {
 		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
 			strerror(errno));
-		exit(EXIT_FAILURE);
+		//exit(EXIT_FAILURE);
+        return;
 	}
 
 	/* Start thread to do statistics display */
-	if (verbose) {
-		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
-				     xsk_socket);
-		if (ret) {
-			fprintf(stderr, "ERROR: Failed creating statistics thread "
-				"\"%s\"\n", strerror(errno));
-			exit(EXIT_FAILURE);
-		}
-	}
+	// if (verbose) {
+	// 	ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
+	// 			     xsk_socket);
+	// 	if (ret) {
+	// 		fprintf(stderr, "ERROR: Failed creating statistics thread "
+	// 			"\"%s\"\n", strerror(errno));
+	// 		exit(EXIT_FAILURE);
+	// 	}
+	// }
 
 	/* Receive and count packets than drop them */
 	rx_and_process(&cfg, xsk_socket);
@@ -607,5 +735,35 @@ int main(int argc, char **argv)
 	xsk_umem__delete(umem->umem);
 	xdp_link_detach(cfg.ifindex, cfg.xdp_flags, 0);
 
-	return EXIT_OK;
+	// return EXIT_OK;
+}
+
+
+int main(int argc, char **argv)
+{
+    int rxq_num;
+    int txq_num;
+    threadpool thpool;
+
+    char* if_name = argv[1];
+    printf("if_name = %s\n", if_name);
+    
+    signal(SIGINT, exit_application);
+
+    
+
+    af_xdp_get_q_count (if_name, &rxq_num, &txq_num);
+    printf("rxq_num = %d, txq = %d\n", rxq_num, txq_num);
+    
+    thpool = thpool_init(rxq_num, "af_xdp");
+    int i;
+    for (i = 0; i < rxq_num; i++)
+    {
+        thpool_add_work(thpool, func, (void*)i);
+    }
+
+    thpool_wait(thpool);
+    
+
+    return 0;
 }

@@ -69,6 +69,7 @@ static int
 af_xdp_load_program (af_xdp_create_if_args_t * args, af_xdp_device_t * ad)
 {
     int fd;
+    struct bpf_map *map;
 
     ad->linux_ifindex = if_nametoindex (ad->linux_ifname);
     if (!ad->linux_ifindex)
@@ -83,7 +84,13 @@ af_xdp_load_program (af_xdp_create_if_args_t * args, af_xdp_device_t * ad)
         goto err0;
     }
 
-    if (bpf_set_link_xdp_fd (ad->linux_ifindex, fd, 0))
+    map = bpf_object__find_map_by_name(obj, "xsks_map");
+	if (!map) {
+		printf("Failed to find xsks_map in %s\n", args->prog);
+		return err1;
+	}
+
+    if (bpf_set_link_xdp_fd (ad->linux_ifindex, fd, XDP_FLAGS_UPDATE_IF_NOEXIST))
     {
         printf ("bpf_set_link_xdp_fd(%s) failed\n", ad->linux_ifname);
         goto err1;
@@ -206,12 +213,12 @@ int af_xdp_create_queue (af_xdp_create_if_args_t *args, af_xdp_device_t *ad, int
     rxq->mode = AF_XDP_RXQ_MODE_POLLING;
 
     memset (&umem_config, 0, sizeof (umem_config));
-    umem_config.fill_size = args->rxq_size;
-    umem_config.comp_size = args->txq_size;
-    umem_config.frame_size = 0;
+    umem_config.fill_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+    umem_config.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+    umem_config.frame_size = 2048;
     umem_config.frame_headroom = 0;
-    //umem_config.flags = XDP_UMEM_UNALIGNED_CHUNK_FLAG;
-    ret = xsk_umem__create(&umem_t->umem, ad->packet_buffer, ad->packet_buffer_size, fq, cq, NULL);
+    //umem_config.flags = 0;
+    ret = xsk_umem__create(&umem_t->umem, ad->packet_buffer, ad->packet_buffer_size, fq, cq, &umem_config);
     if (ret) 
     {
         printf("xsk_umem__create failed, ret = %d\n", ret);
@@ -221,12 +228,13 @@ int af_xdp_create_queue (af_xdp_create_if_args_t *args, af_xdp_device_t *ad, int
     memset (&sock_config, 0, sizeof (sock_config));
     sock_config.rx_size = args->rxq_size;
     sock_config.tx_size = args->txq_size;
-    //sock_config.libbpf_flags = 0;
+    sock_config.libbpf_flags = 0;
     sock_config.bind_flags = XDP_USE_NEED_WAKEUP;
     sock_config.bind_flags &= XDP_ZEROCOPY;
     sock_config.bind_flags |= XDP_COPY;
     sock_config.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */
-    sock_config.xdp_flags |= XDP_FLAGS_SKB_MODE;  /* Set   flag */
+    sock_config.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
+    //sock_config.xdp_flags |= XDP_FLAGS_SKB_MODE;  /* Set   flag */
 
     // switch (args->mode)
     // {
@@ -249,12 +257,12 @@ int af_xdp_create_queue (af_xdp_create_if_args_t *args, af_xdp_device_t *ad, int
     }
 
     fd = xsk_socket__fd (xsk_t->xsk);
-    optlen = sizeof (opt);
-    if (getsockopt (fd, SOL_XDP, XDP_OPTIONS, &opt, &optlen))
-    {
-        printf ("getsockopt(XDP_OPTIONS) failed");
-        goto error_exit;
-    }
+    // optlen = sizeof (opt);
+    // if (getsockopt (fd, SOL_XDP, XDP_OPTIONS, &opt, &optlen))
+    // {
+    //     printf ("getsockopt(XDP_OPTIONS) failed");
+    //     goto error_exit;
+    // }
     // if (opt.flags & XDP_OPTIONS_ZEROCOPY)
     //     ad->flags |= AF_XDP_DEVICE_F_ZEROCOPY;
 
@@ -287,7 +295,9 @@ int af_xdp_create_queue (af_xdp_create_if_args_t *args, af_xdp_device_t *ad, int
 		goto error_exit;
 
     for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i++)
-		*xsk_ring_prod__fill_addr(&rxq->fq, idx++) = xsk_alloc_umem_frame(umem_t);
+    {
+		*xsk_ring_prod__fill_addr(&rxq->fq, idx++) = xsk_alloc_umem_frame(rxq);
+    }
 
     xsk_ring_prod__submit(&rxq->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
 
@@ -443,18 +453,30 @@ void handle_receive_packets(void *arg)
             break;
     }
 
+    if (rxq == NULL)
+    {
+        printf("rxq is NULL\n");
+        return ;
+    }
+
     list_for_each_entry(txq, &txqs_head, list) 
     {
         if (fd == rxq->xsk_fd)
             break;
     }
 
+    if (txq == NULL)
+    {
+        printf("txq is NULL\n");
+        return ;
+    }
+
     rcvd = xsk_ring_cons__peek(&rxq->rx, RX_BATCH_SIZE, &idx_rx);
 	if (!rcvd)
 		return;
 
-    stock_frames = xsk_prod_nb_free(&rxq->fq,
-					xsk_umem_free_frames(rxq));
+    printf("xsk_umem_free_frames(rxq) = %d\n", xsk_umem_free_frames(rxq));
+    stock_frames = xsk_prod_nb_free(&rxq->fq, xsk_umem_free_frames(rxq));
 
     if (stock_frames > 0)
     {

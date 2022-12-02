@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "common_params.h": "c",
+        "if_link.h": "c"
+    }
+}
